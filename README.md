@@ -172,6 +172,49 @@ let codecs: Vec<(Box<dyn EventCodec>, &[(EventKey, EventValue)])> = vec![
 - PRs must add a single file: `src/<your-github-username>.rs`
 - **Submission deadline: March 1st, 2025** — evaluation dataset revealed and winners announced
 
+## External Codecs (Non-Rust)
+
+You can submit codecs in any language by creating a Docker container that implements the encode/decode ABI.
+
+### Directory Structure
+
+```
+src/<github-username>-<lang>/
+├── Dockerfile
+└── <your implementation files>
+```
+
+### ABI Requirements
+
+Your container must accept `encode` or `decode` as the first argument:
+
+```bash
+# Encode: JSON events in via stdin, compressed bytes out via stdout
+docker run <image> encode < events.json > compressed.bin
+
+# Decode: Compressed bytes in via stdin, JSON events out via stdout
+docker run <image> decode < compressed.bin > events.json
+```
+
+### Example Dockerfile (Python)
+
+```dockerfile
+FROM python:3.11-slim
+WORKDIR /app
+COPY codec.py .
+ENTRYPOINT ["python", "codec.py"]
+```
+
+### Testing Locally
+
+```bash
+# Run with Docker support
+cargo run --release -- --docker
+
+# Test specific external codec
+cargo run --release -- --codec <name>-<lang>
+```
+
 ## Generating Your Own Evaluation Dataset
 
 Want to test your codec against different data? You can generate your own dataset

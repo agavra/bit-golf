@@ -159,11 +159,135 @@ fn assert_events_eq(
     );
 }
 
+fn discover_external_codecs() -> Vec<String> {
+    let src_path = std::path::Path::new("src");
+    let mut codecs = Vec::new();
+
+    if let Ok(entries) = std::fs::read_dir(src_path) {
+        for entry in entries.flatten() {
+            let path = entry.path();
+            if path.is_dir() {
+                let dockerfile = path.join("Dockerfile");
+                if dockerfile.exists() {
+                    if let Some(name) = path.file_name().and_then(|n| n.to_str()) {
+                        codecs.push(name.to_string());
+                    }
+                }
+            }
+        }
+    }
+
+    codecs.sort();
+    codecs
+}
+
+fn build_docker_codec(name: &str) -> Result<(), Box<dyn Error>> {
+    let path = format!("src/{}", name);
+
+    let status = std::process::Command::new("docker")
+        .args(["build", "-t", name, &path])
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::piped())
+        .status()?;
+
+    if !status.success() {
+        return Err(format!("Docker build failed for {}", name).into());
+    }
+
+    Ok(())
+}
+
+fn run_docker_encode(
+    image: &str,
+    events: &[(EventKey, EventValue)],
+) -> Result<Vec<u8>, Box<dyn Error>> {
+    use std::io::Write;
+
+    let mut child = std::process::Command::new("docker")
+        .args(["run", "-i", "--rm", image, "encode"])
+        .stdin(std::process::Stdio::piped())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .spawn()?;
+
+    // Write events as line-delimited JSON to stdin
+    {
+        let stdin = child.stdin.as_mut().ok_or("Failed to open stdin")?;
+        for (key, value) in events {
+            let event = serde_json::json!({
+                "id": key.id,
+                "type": key.event_type,
+                "repo": value.repo,
+                "created_at": value.created_at
+            });
+            writeln!(stdin, "{}", serde_json::to_string(&event)?)?;
+        }
+    }
+
+    let output = child.wait_with_output()?;
+
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        return Err(format!("Encode failed: {}", stderr).into());
+    }
+
+    Ok(output.stdout)
+}
+
+fn run_docker_decode(
+    image: &str,
+    data: &[u8],
+) -> Result<Vec<(EventKey, EventValue)>, Box<dyn Error>> {
+    use std::io::Write;
+
+    let mut child = std::process::Command::new("docker")
+        .args(["run", "-i", "--rm", image, "decode"])
+        .stdin(std::process::Stdio::piped())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .spawn()?;
+
+    {
+        let stdin = child.stdin.as_mut().ok_or("Failed to open stdin")?;
+        stdin.write_all(data)?;
+    }
+
+    let output = child.wait_with_output()?;
+
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        return Err(format!("Decode failed: {}", stderr).into());
+    }
+
+    // Parse line-delimited JSON from stdout
+    let stdout = String::from_utf8(output.stdout)?;
+    let mut events = Vec::new();
+
+    for line in stdout.lines() {
+        if line.is_empty() {
+            continue;
+        }
+        let raw: RawGitHubEvent = serde_json::from_str(line)?;
+        let key = EventKey {
+            event_type: raw.event_type,
+            id: raw.id,
+        };
+        let value = EventValue {
+            repo: raw.repo,
+            created_at: raw.created_at,
+        };
+        events.push((key, value));
+    }
+
+    Ok(events)
+}
+
 fn main() -> Result<(), Box<dyn Error>> {
     let args: Vec<String> = std::env::args().collect();
 
     let mut path = "data.json".to_string();
     let mut codec_filter: Option<String> = None;
+    let mut docker_enabled = false;
 
     let mut i = 1;
     while i < args.len() {
@@ -174,6 +298,9 @@ fn main() -> Result<(), Box<dyn Error>> {
                     i += 1;
                 }
             }
+            "--docker" => {
+                docker_enabled = true;
+            }
             arg if !arg.starts_with('-') => {
                 path = arg.to_string();
             }
@@ -181,6 +308,15 @@ fn main() -> Result<(), Box<dyn Error>> {
         }
         i += 1;
     }
+
+    // Auto-enable docker mode if targeting an external codec
+    if let Some(ref filter) = codec_filter {
+        let potential_path = format!("src/{}/Dockerfile", filter);
+        if std::path::Path::new(&potential_path).exists() {
+            docker_enabled = true;
+        }
+    }
+
     let events = load_events(&path)?;
     println!("Loaded {} events from {}\n", events.len(), path);
 
@@ -228,6 +364,62 @@ fn main() -> Result<(), Box<dyn Error>> {
         print_row(codec.name(), encoded.len(), baseline);
         let decoded = codec.decode(&encoded)?;
         assert_events_eq(codec.name(), expected, &decoded);
+    }
+
+    // Run external Docker codecs if --docker flag is set
+    if docker_enabled {
+        let external_codecs = discover_external_codecs();
+        for codec_name in external_codecs {
+            // Skip if filter is set and doesn't match
+            if let Some(ref filter) = codec_filter {
+                if !codec_name.to_lowercase().contains(filter) {
+                    continue;
+                }
+            }
+
+            // Build the Docker image
+            if let Err(e) = build_docker_codec(&codec_name) {
+                println!(
+                    "│ {:<22} │ {:>14} │ {:>10} │",
+                    format!("{} [BUILD FAILED]", codec_name),
+                    "-",
+                    "-"
+                );
+                eprintln!("Build error for {}: {}", codec_name, e);
+                continue;
+            }
+
+            // Run encode
+            let encoded = match run_docker_encode(&codec_name, &events) {
+                Ok(data) => data,
+                Err(e) => {
+                    println!(
+                        "│ {:<22} │ {:>14} │ {:>10} │",
+                        format!("{} [ENCODE FAILED]", codec_name),
+                        "-",
+                        "-"
+                    );
+                    eprintln!("Encode error for {}: {}", codec_name, e);
+                    continue;
+                }
+            };
+
+            print_row(&codec_name, encoded.len(), baseline);
+
+            // Run decode and verify
+            let decoded = match run_docker_decode(&codec_name, &encoded) {
+                Ok(data) => data,
+                Err(e) => {
+                    eprintln!("Decode error for {}: {}", codec_name, e);
+                    continue;
+                }
+            };
+
+            // Sort decoded events for comparison (external codecs may not preserve order)
+            let mut sorted_decoded = decoded.clone();
+            sorted_decoded.sort_by(|a, b| a.0.cmp(&b.0));
+            assert_events_eq(&codec_name, &sorted_events, &sorted_decoded);
+        }
     }
 
     println!("└────────────────────────┴────────────────┴────────────┘");

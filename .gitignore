@@ -15,6 +15,9 @@ Thumbs.db
 *.swo
 *~
 
+# Worktrees
+.worktrees/
+
 # Data (only data.json.gz is tracked)
 *.json
 *.json.gz

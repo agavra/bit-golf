@@ -21,18 +21,27 @@ jobs:
       - name: Detect changed codecs
         id: changed
         run: |
-          # Get list of changed .rs files in src/ (excluding main.rs, codec.rs, lib.rs)
-          CHANGED_FILES=$(git diff --name-only origin/${{ github.base_ref }}...HEAD -- 'src/*.rs' | grep -vE '(main|codec|lib)\.rs$' || true)
+          # Get list of changed Rust codec files (excluding main.rs, codec.rs, lib.rs)
+          RUST_CHANGES=$(git diff --name-only origin/${{ github.base_ref }}...HEAD -- 'src/*.rs' | grep -vE '(main|codec|lib)\.rs$' || true)
 
-          if [ -z "$CHANGED_FILES" ]; then
-            echo "No codec files changed"
-            echo "codecs=" >> $GITHUB_OUTPUT
-          else
-            # Extract codec names (filename without .rs extension)
-            CODECS=$(echo "$CHANGED_FILES" | xargs -n1 basename | sed 's/\.rs$//' | tr '\n' ' ')
-            echo "Changed codecs: $CODECS"
-            echo "codecs=$CODECS" >> $GITHUB_OUTPUT
+          # Get list of changed Docker codec directories
+          DOCKER_CHANGES=$(git diff --name-only origin/${{ github.base_ref }}...HEAD -- 'src/*/Dockerfile' 'src/*/*.py' 'src/*/*.java' 'src/*/*.c' 'src/*/*.go' | xargs -n1 dirname 2>/dev/null | sort -u | xargs -n1 basename 2>/dev/null || true)
+
+          RUST_CODECS=""
+          DOCKER_CODECS=""
+
+          if [ -n "$RUST_CHANGES" ]; then
+            RUST_CODECS=$(echo "$RUST_CHANGES" | xargs -n1 basename | sed 's/\.rs$//' | tr '\n' ' ')
           fi
+
+          if [ -n "$DOCKER_CHANGES" ]; then
+            DOCKER_CODECS=$(echo "$DOCKER_CHANGES" | tr '\n' ' ')
+          fi
+
+          echo "Rust codecs: $RUST_CODECS"
+          echo "Docker codecs: $DOCKER_CODECS"
+          echo "rust_codecs=$RUST_CODECS" >> $GITHUB_OUTPUT
+          echo "docker_codecs=$DOCKER_CODECS" >> $GITHUB_OUTPUT
 
       - name: Setup Rust
         uses: dtolnay/rust-toolchain@stable
@@ -54,19 +63,27 @@ jobs:
       - name: Build
         run: cargo build --release
 
-      - name: Run codec tests
-        id: test
+      - name: Run Rust codec tests
+        if: steps.changed.outputs.rust_codecs != ''
         run: |
-          CODECS="${{ steps.changed.outputs.codecs }}"
-          if [ -z "$CODECS" ]; then
-            echo "No codec changes detected, running all codecs"
-            cargo run --release 2>&1 | tee results.txt
-          else
-            for codec in $CODECS; do
-              echo "Testing codec: $codec"
-              cargo run --release -- --codec "$codec" 2>&1 | tee -a results.txt
-            done
-          fi
+          for codec in ${{ steps.changed.outputs.rust_codecs }}; do
+            echo "Testing Rust codec: $codec"
+            cargo run --release -- --codec "$codec" 2>&1 | tee -a results.txt
+          done
+
+      - name: Run Docker codec tests
+        if: steps.changed.outputs.docker_codecs != ''
+        run: |
+          for codec in ${{ steps.changed.outputs.docker_codecs }}; do
+            echo "Testing Docker codec: $codec"
+            cargo run --release -- --docker --codec "$codec" 2>&1 | tee -a results.txt
+          done
+
+      - name: Run all codecs (no changes detected)
+        if: steps.changed.outputs.rust_codecs == '' && steps.changed.outputs.docker_codecs == ''
+        run: |
+          echo "No codec changes detected, running all codecs"
+          cargo run --release -- --docker 2>&1 | tee results.txt
 
       - name: Check formatting
         run: cargo fmt --check
